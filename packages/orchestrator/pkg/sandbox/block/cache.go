@@ -15,6 +15,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unsafe"
 
 	"github.com/RoaringBitmap/roaring/v2"
 	"github.com/edsrzf/mmap-go"
@@ -507,6 +508,36 @@ func (c *Cache) Close() (e error) {
 	e = errors.Join(e, os.RemoveAll(c.filePath))
 
 	return e
+}
+
+func (c *Cache) RegisterWith(registrar interface {
+	RegisterBuffer(ptr uintptr, size uint64) error
+	UnregisterBuffer(ptr uintptr) error
+}) (func() error, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	if c.isClosed() {
+		return nil, NewErrCacheClosed(c.filePath)
+	}
+	if c.mmap == nil || len(*c.mmap) == 0 {
+		return func() error { return nil }, nil
+	}
+
+	ptr := uintptr(unsafe.Pointer(&(*c.mmap)[0]))
+	size := uint64(len(*c.mmap))
+	if err := registrar.RegisterBuffer(ptr, size); err != nil {
+		return nil, err
+	}
+
+	var once sync.Once
+	return func() (err error) {
+		once.Do(func() {
+			err = registrar.UnregisterBuffer(ptr)
+		})
+
+		return err
+	}, nil
 }
 
 func (c *Cache) Size() (int64, error) {

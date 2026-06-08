@@ -31,6 +31,7 @@ type Chunker struct {
 	metrics      metrics.Metrics
 	fetchTimeout time.Duration
 	featureFlags *featureflags.Client
+	unregister   func() error
 
 	size int64
 
@@ -55,6 +56,16 @@ func NewChunker(
 		return nil, fmt.Errorf("failed to create file cache: %w", err)
 	}
 
+	var unregister func() error
+	if registrar, ok := upstream.(storage.BufferRegistrar); ok {
+		unregister, err = cache.RegisterWith(registrar)
+		if err != nil {
+			_ = cache.Close()
+
+			return nil, fmt.Errorf("failed to register file cache: %w", err)
+		}
+	}
+
 	return &Chunker{
 		size:         size,
 		upstream:     upstream,
@@ -62,6 +73,7 @@ func NewChunker(
 		metrics:      metrics,
 		featureFlags: ff,
 		fetchTimeout: defaultFetchTimeout,
+		unregister:   unregister,
 	}, nil
 }
 
@@ -241,6 +253,25 @@ func (c *Chunker) runFetch(ctx context.Context, s *fetchSession, ft *storage.Fra
 }
 
 func (c *Chunker) progressiveRead(ctx context.Context, s *fetchSession, mmapSlice []byte, ft *storage.FrameTable) (totalRead int64, err error) {
+	if direct, ok := c.upstream.(storage.DirectRangeReader); ok {
+		n, err := direct.ReadRangeInto(ctx, mmapSlice[:s.chunkLen], s.chunkOff, ft)
+		totalRead = n
+		if n > 0 {
+			sw := c.metrics.WriteChunksTimerFactory.Begin()
+			if err == nil || n >= s.chunkLen {
+				sw.RecordRaw(ctx, n, writeSuccessAttr)
+			} else {
+				sw.RecordRaw(ctx, n, writeFailureAttr)
+			}
+			s.advance(n)
+		}
+		if err != nil && n < s.chunkLen {
+			return n, fmt.Errorf("failed direct range read at offset %d after %d bytes: %w", s.chunkOff, n, err)
+		}
+
+		return n, nil
+	}
+
 	reader, err := c.upstream.OpenRangeReader(ctx, s.chunkOff, s.chunkLen, ft)
 	if err != nil {
 		return 0, fmt.Errorf("failed to open range reader at %d: %w", s.chunkOff, err)
@@ -321,7 +352,12 @@ func (c *Chunker) locateChunk(off int64, ft *storage.FrameTable) (chunkOff, chun
 }
 
 func (c *Chunker) Close() error {
-	return c.cache.Close()
+	var err error
+	if c.unregister != nil {
+		err = c.unregister()
+	}
+
+	return errors.Join(err, c.cache.Close())
 }
 
 // IsCached reports whether [off, off+length) is fully present in the local
