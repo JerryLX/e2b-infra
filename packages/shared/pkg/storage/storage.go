@@ -37,6 +37,7 @@ const (
 	GCPStorageProvider   Provider = "GCPBucket"
 	AWSStorageProvider   Provider = "AWSBucket"
 	LocalStorageProvider Provider = "Local"
+	MooncakeProvider     Provider = "Mooncake"
 
 	DefaultStorageProvider Provider = GCPStorageProvider
 
@@ -250,14 +251,14 @@ func GetStorageProvider(ctx context.Context, cfg StorageConfig) (StorageProvider
 		return newFileSystemStorage(cfg), nil
 	}
 
-	bucketName := cfg.GetBucketName()
-
 	// cloud bucket-based storage
 	switch provider {
 	case AWSStorageProvider:
-		return newAWSStorage(ctx, bucketName)
+		return newAWSStorage(ctx, cfg.GetBucketName())
 	case GCPStorageProvider:
-		return NewGCP(ctx, bucketName, cfg.limiter)
+		return NewGCP(ctx, cfg.GetBucketName(), cfg.limiter)
+	case MooncakeProvider:
+		return newMooncakeStorageFromEnv(cfg)
 	}
 
 	return nil, fmt.Errorf("unknown storage provider: %s", provider)
