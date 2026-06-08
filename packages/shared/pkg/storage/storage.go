@@ -152,6 +152,20 @@ type StreamingReader interface {
 	OpenRangeReader(ctx context.Context, offsetU int64, length int64, frameTable *FrameTable) (io.ReadCloser, error)
 }
 
+// DirectRangeReader can read directly into caller-owned memory. Backends that
+// support registered-memory transports use this to avoid allocating an
+// intermediate reader buffer.
+type DirectRangeReader interface {
+	ReadRangeInto(ctx context.Context, dst []byte, off int64, frameTable *FrameTable) (int64, error)
+}
+
+// BufferRegistrar registers caller-owned memory with a transport backend.
+// The registered memory must stay valid until UnregisterBuffer is called.
+type BufferRegistrar interface {
+	RegisterBuffer(ptr uintptr, size uint64) error
+	UnregisterBuffer(ptr uintptr) error
+}
+
 type SeekableWriter interface {
 	// Store entire file. Compression is opt-in via WithCompressConfig.
 	StoreFile(ctx context.Context, path string, opts ...PutOption) (*FrameTable, [32]byte, error)

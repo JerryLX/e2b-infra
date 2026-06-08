@@ -1,0 +1,223 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>E2B Mooncake Storage 使用说明</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f7f8fa;
+      --panel: #ffffff;
+      --text: #1f2937;
+      --muted: #5b6472;
+      --line: #d9dee7;
+      --accent: #0f766e;
+      --code: #111827;
+      --code-bg: #eef2f6;
+    }
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.55;
+    }
+    main {
+      max-width: 980px;
+      margin: 0 auto;
+      padding: 40px 24px 64px;
+    }
+    h1, h2, h3 {
+      line-height: 1.2;
+      margin: 0 0 14px;
+    }
+    h1 {
+      font-size: 30px;
+      margin-bottom: 10px;
+    }
+    h2 {
+      font-size: 22px;
+      margin-top: 34px;
+      padding-top: 22px;
+      border-top: 1px solid var(--line);
+    }
+    h3 {
+      font-size: 17px;
+      margin-top: 24px;
+    }
+    p {
+      margin: 0 0 14px;
+      color: var(--muted);
+    }
+    .summary {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 18px;
+      margin: 22px 0;
+    }
+    code {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      background: var(--code-bg);
+      color: var(--code);
+      border-radius: 5px;
+      padding: 2px 5px;
+      font-size: 0.92em;
+    }
+    pre {
+      overflow-x: auto;
+      background: #111827;
+      color: #f9fafb;
+      border-radius: 8px;
+      padding: 16px;
+      margin: 12px 0 20px;
+      font-size: 13px;
+    }
+    pre code {
+      background: transparent;
+      color: inherit;
+      padding: 0;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 12px 0 24px;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      overflow: hidden;
+      display: table;
+    }
+    th, td {
+      border-bottom: 1px solid var(--line);
+      padding: 10px 12px;
+      text-align: left;
+      vertical-align: top;
+    }
+    th {
+      color: var(--text);
+      background: #edf5f4;
+      font-weight: 650;
+    }
+    tr:last-child td {
+      border-bottom: 0;
+    }
+    .ok {
+      color: var(--accent);
+      font-weight: 650;
+    }
+    @media (max-width: 720px) {
+      main {
+        padding: 26px 16px 44px;
+      }
+      table, thead, tbody, tr, th, td {
+        display: block;
+      }
+      th {
+        display: none;
+      }
+      td {
+        border-bottom: 0;
+        padding: 8px 12px;
+      }
+      tr {
+        border-bottom: 1px solid var(--line);
+        padding: 6px 0;
+      }
+    }
+  </style>
+</head>
+<body>
+<main>
+  <h1>E2B Mooncake Storage 使用说明</h1>
+  <p>本文说明如何在 e2b-infra 中使用 Mooncake 作为 storage backend，以及如何在具备 Mooncake C/Go binding 和 URMA transport 的节点上启用 host cache 注册，减少 Mooncake 到本机 mmap cache 的中间拷贝。</p>
+
+  <div class="summary">
+    <p><span class="ok">默认模式</span>：只需要 HTTP Mooncake 服务，使用 <code>STORAGE_PROVIDER=Mooncake</code> 和 <code>MOONCAKE_HTTP_ENDPOINT</code>。</p>
+    <p><span class="ok">零拷贝模式</span>：需要用 <code>-tags mooncake_cgo</code> 编译，并设置 <code>MOONCAKE_NATIVE_ENABLED=true</code>。chunker 创建本地 mmap cache 后会调用 Mooncake native client 的 <code>RegisterBuffer</code>，读取 chunk 时使用 <code>GetInto</code> 直接写入已注册的 mmap slice。</p>
+  </div>
+
+  <h2>普通 Mooncake HTTP 模式</h2>
+  <p>该模式不依赖 Mooncake C 库或 URMA。它保持现有 HTTP object API 行为，适合开发、CI 和没有 RDMA/URMA 环境的节点。</p>
+  <pre><code>export STORAGE_PROVIDER=Mooncake
+export MOONCAKE_HTTP_ENDPOINT=http://mooncake-http.example:8080
+export MOONCAKE_NAMESPACE=templates
+
+# 可选
+export MOONCAKE_UPLOAD_CONCURRENCY=16
+export MOONCAKE_WRITE_TIMEOUT_SECONDS=30
+export MOONCAKE_READ_TIMEOUT_SECONDS=15
+export MOONCAKE_OPERATION_TIMEOUT_SECONDS=5</code></pre>
+
+  <h2>URMA 零拷贝模式</h2>
+  <p>该模式依赖 Mooncake native Go binding 和 Mooncake C/C++ build 产物。不要在普通节点启用 <code>mooncake_cgo</code> tag；只有具备 Mooncake 头文件、动态库、URMA/ibverbs 运行环境的节点才应该使用。</p>
+
+  <h3>构建前准备</h3>
+  <p>Mooncake Go binding 使用模块路径 <code>github.com/kvcache-ai/Mooncake/mooncake-store/go</code>。如果该模块不在公网模块代理中，请在有 Mooncake 源码的节点上用 workspace 或 replace 指向本地源码。</p>
+  <pre><code># 示例：在编译节点创建本地 workspace 映射
+go work use /home/lixu/e2b-infra/packages/shared
+go work use /home/lixu/e2b-infra/packages/orchestrator
+go work use /home/lixu/Mooncake/mooncake-store/go</code></pre>
+
+  <h3>CGO flags</h3>
+  <p>按 Mooncake build 目录调整以下路径。URMA 环境通常还需要系统库路径能找到 <code>liburma.so</code>、<code>libibverbs.so</code> 等依赖。</p>
+  <pre><code>export CGO_ENABLED=1
+export CGO_CFLAGS="-I/home/lixu/Mooncake/mooncake-store/include -I/home/lixu/Mooncake/mooncake-transfer-engine/include"
+export CGO_LDFLAGS="-L/home/lixu/Mooncake/build/mooncake-store/src \
+-L/home/lixu/Mooncake/build/mooncake-store/src/cachelib_memory_allocator \
+-L/home/lixu/Mooncake/build/mooncake-transfer-engine/src \
+-L/home/lixu/Mooncake/build/mooncake-transfer-engine/src/common/base \
+-L/home/lixu/Mooncake/build/mooncake-common \
+-L/home/lixu/Mooncake/build/mooncake-common/src \
+-lmooncake_store -lcachelib_memory_allocator -ltransfer_engine -lbase -lasio -lmooncake_common \
+-lstdc++ -lnuma -lglog -lgflags -libverbs -ljsoncpp -lzstd -lcurl -luring"</code></pre>
+
+  <h3>运行参数</h3>
+  <table>
+    <thead>
+    <tr><th>变量</th><th>用途</th><th>示例或默认值</th></tr>
+    </thead>
+    <tbody>
+    <tr><td><code>STORAGE_PROVIDER</code></td><td>选择 Mooncake backend</td><td><code>Mooncake</code></td></tr>
+    <tr><td><code>MOONCAKE_NATIVE_ENABLED</code></td><td>启用 native client 和 buffer registration</td><td><code>true</code></td></tr>
+    <tr><td><code>MOONCAKE_NAMESPACE</code></td><td>对象 key 前缀；为空时使用 bucket name</td><td><code>templates</code></td></tr>
+    <tr><td><code>MC_METADATA_SERVER</code></td><td>Mooncake metadata server 地址</td><td><code>http://host:8080/metadata</code></td></tr>
+    <tr><td><code>MC_MASTER_ADDR</code></td><td>Mooncake master gRPC 地址</td><td><code>host:50051</code></td></tr>
+    <tr><td><code>MC_LOCAL_HOSTNAME</code></td><td>本节点给 Mooncake transfer engine 使用的 hostname/IP</td><td><code>localhost</code></td></tr>
+    <tr><td><code>MC_PROTOCOL</code></td><td>Mooncake transport protocol</td><td><code>rdma</code></td></tr>
+    <tr><td><code>MC_DEVICE_NAME</code></td><td>RDMA/URMA 设备名；为空时交给 Mooncake 自动发现</td><td><code></code></td></tr>
+    <tr><td><code>MC_GLOBAL_SEGMENT_SIZE</code></td><td>Mooncake global segment size</td><td><code>536870912</code></td></tr>
+    <tr><td><code>MC_LOCAL_BUFFER_SIZE</code></td><td>Mooncake local transfer buffer size</td><td><code>134217728</code></td></tr>
+    </tbody>
+  </table>
+
+  <pre><code>export STORAGE_PROVIDER=Mooncake
+export MOONCAKE_NATIVE_ENABLED=true
+export MOONCAKE_NAMESPACE=templates
+export MC_METADATA_SERVER=http://mooncake-master:8080/metadata
+export MC_MASTER_ADDR=mooncake-master:50051
+export MC_LOCAL_HOSTNAME=$(hostname -I | awk '{print $1}')
+export MC_PROTOCOL=rdma
+
+go test -tags mooncake_cgo ./packages/shared/pkg/storage
+go test -tags mooncake_cgo ./packages/orchestrator/pkg/sandbox/block</code></pre>
+
+  <h2>零拷贝生效路径</h2>
+  <p>template/build diff 读取时，orchestrator 的 chunker 会创建本地 mmap cache。若 upstream storage object 实现了 buffer registration，chunker 初始化阶段注册整段 mmap；每次 fetch chunk 时，如果 upstream 支持 direct range read，就把 Mooncake object 直接读入该 mmap slice。chunker 关闭时先 unregister，再 unmap 和删除 cache 文件。</p>
+
+  <h2>排查</h2>
+  <table>
+    <thead>
+    <tr><th>现象</th><th>处理</th></tr>
+    </thead>
+    <tbody>
+    <tr><td><code>MOONCAKE_NATIVE_ENABLED=true requires building with -tags mooncake_cgo</code></td><td>当前 binary 未启用 native build tag，重新用 <code>-tags mooncake_cgo</code> 编译。</td></tr>
+    <tr><td><code>fatal error: store_c.h: No such file or directory</code></td><td>检查 <code>CGO_CFLAGS</code> 是否包含 <code>mooncake-store/include</code>。</td></tr>
+    <tr><td>链接 Mooncake 符号失败</td><td>检查 <code>CGO_LDFLAGS</code> 中 Mooncake build 目录、库顺序和系统依赖。必要时参考 Mooncake 的 <code>mooncake-store/go/build.sh</code>。</td></tr>
+    <tr><td>注册 buffer 失败</td><td>确认 URMA/RDMA 设备、权限、memlock limit、hugepage/ibverbs/urma runtime 已正确配置。</td></tr>
+    </tbody>
+  </table>
+</main>
+</body>
+</html>

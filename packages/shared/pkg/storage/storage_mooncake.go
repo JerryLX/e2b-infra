@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"path"
+	"strconv"
 	"strings"
 	"time"
 
@@ -22,15 +23,28 @@ import (
 const (
 	mooncakeEndpointEnv          = "MOONCAKE_HTTP_ENDPOINT"
 	mooncakeNamespaceEnv         = "MOONCAKE_NAMESPACE"
+	mooncakeNativeEnabledEnv     = "MOONCAKE_NATIVE_ENABLED"
 	mooncakeWriteTimeoutEnv      = "MOONCAKE_WRITE_TIMEOUT_SECONDS"
 	mooncakeReadTimeoutEnv       = "MOONCAKE_READ_TIMEOUT_SECONDS"
 	mooncakeOperationTimeoutEnv  = "MOONCAKE_OPERATION_TIMEOUT_SECONDS"
 	mooncakeUploadConcurrencyEnv = "MOONCAKE_UPLOAD_CONCURRENCY"
+	mooncakeLocalHostnameEnv     = "MC_LOCAL_HOSTNAME"
+	mooncakeMetadataServerEnv    = "MC_METADATA_SERVER"
+	mooncakeGlobalSegmentSizeEnv = "MC_GLOBAL_SEGMENT_SIZE"
+	mooncakeLocalBufferSizeEnv   = "MC_LOCAL_BUFFER_SIZE"
+	mooncakeProtocolEnv          = "MC_PROTOCOL"
+	mooncakeDeviceNameEnv        = "MC_DEVICE_NAME"
+	mooncakeMasterAddrEnv        = "MC_MASTER_ADDR"
+	mooncakeMemPoolSizeEnv       = "MC_MEM_POOL_SIZE"
+	mooncakeServerAddressEnv     = "MC_SERVER_ADDRESS"
+	mooncakeIPCSocketPathEnv     = "MC_IPC_SOCKET_PATH"
 
 	defaultMooncakeWriteTimeoutSeconds     = 30
 	defaultMooncakeReadTimeoutSeconds      = 15
 	defaultMooncakeOperationTimeoutSeconds = 5
 	defaultMooncakeUploadConcurrency       = 16
+	defaultMooncakeGlobalSegmentSize       = 512 * 1024 * 1024
+	defaultMooncakeLocalBufferSize         = 128 * 1024 * 1024
 
 	mooncakeManifestSuffix = ".manifest"
 	mooncakeBlocksDir      = ".blocks"
@@ -44,6 +58,15 @@ type mooncakeClient interface {
 	Exists(ctx context.Context, key string) (bool, error)
 	Delete(ctx context.Context, key string) error
 	DeletePrefix(ctx context.Context, prefix string) error
+}
+
+type mooncakeRegisteringClient interface {
+	RegisterBuffer(ptr uintptr, size uint64) error
+	UnregisterBuffer(ptr uintptr) error
+}
+
+type mooncakeRegisteredReader interface {
+	ReadIntoRegistered(ctx context.Context, key string, dst []byte) (int, error)
 }
 
 type mooncakeStorage struct {
@@ -83,11 +106,6 @@ type mooncakeManifest struct {
 }
 
 func newMooncakeStorageFromEnv(cfg StorageConfig) (*mooncakeStorage, error) {
-	endpoint := os.Getenv(mooncakeEndpointEnv)
-	if endpoint == "" {
-		return nil, fmt.Errorf("%s is required when STORAGE_PROVIDER=%s", mooncakeEndpointEnv, MooncakeProvider)
-	}
-
 	namespace := os.Getenv(mooncakeNamespaceEnv)
 	if namespace == "" {
 		namespace = cfg.GetBucketName()
@@ -114,6 +132,25 @@ func newMooncakeStorageFromEnv(cfg StorageConfig) (*mooncakeStorage, error) {
 	}
 	if uploadConcurrency <= 0 {
 		uploadConcurrency = defaultMooncakeUploadConcurrency
+	}
+
+	if mooncakeNativeEnabled() {
+		client, err := newNativeMooncakeClientFromEnv()
+		if err != nil {
+			return nil, err
+		}
+
+		return newMooncakeStorage(
+			client,
+			namespace,
+			MemoryChunkSize,
+			uploadConcurrency,
+		), nil
+	}
+
+	endpoint := os.Getenv(mooncakeEndpointEnv)
+	if endpoint == "" {
+		return nil, fmt.Errorf("%s is required when STORAGE_PROVIDER=%s", mooncakeEndpointEnv, MooncakeProvider)
 	}
 
 	return newMooncakeStorage(
@@ -298,6 +335,59 @@ func (s *mooncakeSeekable) OpenRangeReader(ctx context.Context, off, length int6
 	}
 
 	return io.NopCloser(bytes.NewReader(data[:n])), err
+}
+
+func (s *mooncakeSeekable) ReadRangeInto(ctx context.Context, dst []byte, off int64, frameTable *FrameTable) (int64, error) {
+	if frameTable.IsCompressed() {
+		return 0, errors.New("mooncake storage does not support compressed seekable objects yet")
+	}
+
+	if len(dst) == 0 {
+		return 0, ErrBufferTooSmall
+	}
+	if off < 0 {
+		return 0, fmt.Errorf("offset must be non-negative")
+	}
+
+	manifest, err := s.loadManifest(ctx)
+	if err != nil {
+		return 0, err
+	}
+	if off >= manifest.Size {
+		return 0, io.EOF
+	}
+
+	remaining := int64(len(dst))
+	if off+remaining > manifest.Size {
+		remaining = manifest.Size - off
+	}
+
+	total := 0
+	registered, _ := s.client.(mooncakeRegisteredReader)
+	for remaining > 0 {
+		blockIdx := off / manifest.BlockSize
+		blockOffset := off % manifest.BlockSize
+		readLen := min(remaining, manifest.BlockSize-blockOffset)
+
+		var n int
+		if blockOffset == 0 && registered != nil {
+			n, err = registered.ReadIntoRegistered(ctx, s.blockKey(blockIdx), dst[total:total+int(readLen)])
+		} else {
+			n, err = s.readBlockInto(ctx, blockIdx, blockOffset, dst[total:total+int(readLen)])
+		}
+		if err != nil {
+			return int64(total + n), err
+		}
+		total += n
+		off += int64(n)
+		remaining -= int64(n)
+
+		if int64(n) < readLen {
+			return int64(total), io.EOF
+		}
+	}
+
+	return int64(total), nil
 }
 
 func (s *mooncakeSeekable) StoreFile(ctx context.Context, filePath string, opts ...PutOption) (*FrameTable, [32]byte, error) {
@@ -589,4 +679,23 @@ func mooncakeHTTPStatusError(resp *http.Response, okStatuses ...int) error {
 	}
 
 	return fmt.Errorf("mooncake http request failed: status %d", resp.StatusCode)
+}
+
+func mooncakeNativeEnabled() bool {
+	v := strings.TrimSpace(os.Getenv(mooncakeNativeEnabledEnv))
+	return strings.EqualFold(v, "true") || v == "1" || strings.EqualFold(v, "yes")
+}
+
+func mooncakeEnvUint64(key string, fallback uint64) (uint64, error) {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return fallback, nil
+	}
+
+	n, err := strconv.ParseUint(v, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("failed to parse %s: %w", key, err)
+	}
+
+	return n, nil
 }
