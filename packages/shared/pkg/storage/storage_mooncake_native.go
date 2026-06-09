@@ -55,7 +55,7 @@ func newNativeMooncakeClientFromEnv() (mooncakeClient, error) {
 		metadataServer,
 		globalSegmentSize,
 		localBufferSize,
-		envString(mooncakeProtocolEnv, "rdma"),
+		envString(mooncakeProtocolEnv, "urma"),
 		envString(mooncakeDeviceNameEnv, ""),
 		masterAddr,
 		memPoolSize,
