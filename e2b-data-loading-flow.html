@@ -1,0 +1,363 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>E2B 数据加载流程与 Mooncake 性能分析</title>
+  <style>
+    :root {
+      --bg: #f6f7f9;
+      --surface: #ffffff;
+      --text: #172033;
+      --muted: #5d6676;
+      --line: #d8dee8;
+      --accent: #0f766e;
+      --accent-2: #1d4ed8;
+      --warn: #b45309;
+      --code-bg: #edf1f6;
+      --code-text: #111827;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      line-height: 1.58;
+    }
+    main {
+      max-width: 1120px;
+      margin: 0 auto;
+      padding: 40px 24px 72px;
+    }
+    h1, h2, h3 {
+      line-height: 1.22;
+      margin: 0 0 14px;
+    }
+    h1 { font-size: 32px; letter-spacing: 0; }
+    h2 {
+      font-size: 23px;
+      margin-top: 38px;
+      padding-top: 24px;
+      border-top: 1px solid var(--line);
+    }
+    h3 { font-size: 18px; margin-top: 24px; }
+    p { margin: 0 0 14px; color: var(--muted); }
+    code {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 0.92em;
+      color: var(--code-text);
+      background: var(--code-bg);
+      border-radius: 5px;
+      padding: 2px 5px;
+    }
+    pre {
+      overflow-x: auto;
+      margin: 12px 0 20px;
+      padding: 16px;
+      border-radius: 8px;
+      background: #111827;
+      color: #f9fafb;
+      font-size: 13px;
+    }
+    pre code {
+      color: inherit;
+      background: transparent;
+      padding: 0;
+    }
+    .summary {
+      margin: 22px 0 28px;
+      padding: 18px;
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px;
+      margin: 16px 0 24px;
+    }
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 16px;
+    }
+    .card h3 { margin-top: 0; }
+    .tag {
+      display: inline-block;
+      margin: 0 6px 6px 0;
+      padding: 3px 7px;
+      border-radius: 6px;
+      background: #e7f3f1;
+      color: var(--accent);
+      font-size: 12px;
+      font-weight: 650;
+    }
+    .flow {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 10px;
+      margin: 14px 0 24px;
+    }
+    .step {
+      min-height: 92px;
+      padding: 12px;
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      position: relative;
+    }
+    .step strong {
+      display: block;
+      margin-bottom: 6px;
+      color: var(--text);
+    }
+    .step span {
+      color: var(--muted);
+      font-size: 13px;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 12px 0 24px;
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      overflow: hidden;
+    }
+    th, td {
+      padding: 10px 12px;
+      text-align: left;
+      vertical-align: top;
+      border-bottom: 1px solid var(--line);
+    }
+    th {
+      background: #edf5f4;
+      color: var(--text);
+      font-weight: 650;
+    }
+    tr:last-child td { border-bottom: 0; }
+    .good { color: var(--accent); font-weight: 650; }
+    .neutral { color: var(--accent-2); font-weight: 650; }
+    .warn { color: var(--warn); font-weight: 650; }
+    .note {
+      border-left: 4px solid var(--accent);
+      background: #eef8f6;
+      padding: 12px 14px;
+      margin: 16px 0 22px;
+      border-radius: 0 8px 8px 0;
+      color: var(--muted);
+    }
+    @media (max-width: 860px) {
+      main { padding: 28px 16px 52px; }
+      .grid, .flow { grid-template-columns: 1fr; }
+      table, thead, tbody, tr, th, td { display: block; }
+      thead { display: none; }
+      tr { border-bottom: 1px solid var(--line); padding: 8px 0; }
+      td { border-bottom: 0; padding: 7px 12px; }
+      td::before {
+        content: attr(data-label);
+        display: block;
+        color: var(--text);
+        font-weight: 650;
+        margin-bottom: 2px;
+      }
+    }
+  </style>
+</head>
+<body>
+<main>
+  <h1>E2B 数据加载流程与 Mooncake 性能分析</h1>
+  <p>本文描述 sandbox 启动时 template 数据从持久化存储加载到本机 host cache，再被 Firecracker/Rootfs/NBD/UFFD 读取的完整链路；同时对比传统对象存储路径和 Mooncake 路径，说明 Mooncake native + URMA 注册 host cache 后的性能收益与限制。</p>
+
+  <div class="summary">
+    <p><span class="tag">核心路径</span><code>GetTemplate</code> 命中 template cache 后直接复用；未命中时构造 <code>storageTemplate</code>，后台 <code>Fetch</code> 并行准备 <code>snapfile</code>、<code>metadata</code>、<code>memfile</code>、<code>rootfs</code>。</p>
+    <p><span class="tag">数据面</span><code>memfile/rootfs</code> 不是一次性全量下载，而是通过 <code>StorageDiff</code> 和 <code>Chunker</code> 按 chunk 懒加载到 mmap cache。</p>
+    <p><span class="tag">Mooncake zero-copy</span> 当 Mooncake native seekable 同时实现 <code>BufferRegistrar</code> 和 <code>DirectRangeReader</code> 时，chunker 注册整段 mmap cache，并让 Mooncake 直接写入该 mmap slice。</p>
+  </div>
+
+  <h2>一、E2B 数据对象</h2>
+  <table>
+    <thead>
+    <tr><th>对象</th><th>用途</th><th>加载特点</th></tr>
+    </thead>
+    <tbody>
+    <tr><td data-label="对象"><code>metadata</code></td><td data-label="用途">template 元数据，描述版本、层、预取等信息。</td><td data-label="加载特点">普通 blob 文件，启动早期读取；缺失时可回退 v1 metadata。</td></tr>
+    <tr><td data-label="对象"><code>snapfile</code></td><td data-label="用途">Firecracker snapshot state。</td><td data-label="加载特点">普通文件，使用 <code>newStorageFile</code> 缓存到本地路径。</td></tr>
+    <tr><td data-label="对象"><code>memfile</code></td><td data-label="用途">VM 内存镜像或增量 diff。</td><td data-label="加载特点">seekable，大文件，按 chunk/page fault 懒加载到 mmap cache。</td></tr>
+    <tr><td data-label="对象"><code>rootfs</code></td><td data-label="用途">根文件系统镜像或增量 diff。</td><td data-label="加载特点">seekable，大文件，NBD/overlay 读取触发懒加载。</td></tr>
+    <tr><td data-label="对象"><code>header</code></td><td data-label="用途">描述 build diff 链、block size、压缩 frame table、base build 等。</td><td data-label="加载特点">先于 <code>StorageDiff</code> 解析，决定读取链路和解压映射。</td></tr>
+    </tbody>
+  </table>
+
+  <h2>二、启动时完整加载流程</h2>
+  <div class="flow">
+    <div class="step"><strong>1. 请求 template</strong><span>server 或 build 流程调用 <code>template.Cache.GetTemplate(buildID)</code>。</span></div>
+    <div class="step"><strong>2. 查本机 TTL cache</strong><span><code>ttlcache</code> 命中则复用已创建的 <code>Template</code> 和 diff store。</span></div>
+    <div class="step"><strong>3. 构造 storageTemplate</strong><span>根据 buildID 生成 remote path 和 local cache path。</span></div>
+    <div class="step"><strong>4. 后台 Fetch</strong><span>并行准备 snapfile、metadata、memfile、rootfs。</span></div>
+  </div>
+
+  <div class="flow">
+    <div class="step"><strong>5. 加载 header</strong><span><code>NewStorage</code> 获取 memfile/rootfs header；老格式会回退推导 header。</span></div>
+    <div class="step"><strong>6. 创建 build.File</strong><span>按 header 中的 build chain 决定从哪个 diff 读取。</span></div>
+    <div class="step"><strong>7. 初始化 StorageDiff</strong><span><code>OpenSeekable</code> 打开远端对象，创建本地 chunker mmap cache。</span></div>
+    <div class="step"><strong>8. 懒加载数据</strong><span>首次读某个范围时 chunker fetch 远端 chunk，写入 mmap 并标记 cached。</span></div>
+  </div>
+
+  <h3>代码入口对应关系</h3>
+  <table>
+    <thead>
+    <tr><th>阶段</th><th>主要代码</th><th>说明</th></tr>
+    </thead>
+    <tbody>
+    <tr><td data-label="阶段">template cache</td><td data-label="主要代码"><code>packages/orchestrator/pkg/sandbox/template/cache.go</code></td><td data-label="说明"><code>GetTemplate</code> 负责 TTL cache、NFS cache wrapper、peer routing wrapper 和后台 fetch。</td></tr>
+    <tr><td data-label="阶段">template materialization</td><td data-label="主要代码"><code>template/storage_template.go</code></td><td data-label="说明"><code>Fetch</code> 并行设置 snapfile/metafile/memfile/rootfs 的 <code>SetOnce</code>。</td></tr>
+    <tr><td data-label="阶段">header + build chain</td><td data-label="主要代码"><code>template/storage.go</code>、<code>build/build.go</code></td><td data-label="说明"><code>NewStorage</code> 加载 header，<code>build.File</code> 根据 header 获取具体 diff。</td></tr>
+    <tr><td data-label="阶段">remote seekable diff</td><td data-label="主要代码"><code>build/storage_diff.go</code></td><td data-label="说明"><code>StorageDiff.Init</code> 调 <code>OpenSeekable</code> 并创建 chunker。</td></tr>
+    <tr><td data-label="阶段">chunk cache</td><td data-label="主要代码"><code>block/streaming_chunk.go</code>、<code>block/cache.go</code></td><td data-label="说明">本机 sparse file + mmap，按 chunk fetch，读后 <code>setIsCached</code>。</td></tr>
+    </tbody>
+  </table>
+
+  <h2>三、传统数据加载方式</h2>
+  <p>传统模式包括 GCS、S3、本地 filesystem，或在其上包一层 NFS cache / peer routing。核心特征是远端对象通过 stream reader 进入进程，再由 Go 代码复制到 chunker 的 mmap cache。</p>
+
+  <h3>传统 seekable read 路径</h3>
+  <pre><code>Sandbox start
+  -> GetTemplate(buildID)
+  -> storageTemplate.Fetch()
+  -> NewStorage(memfile/rootfs)
+  -> build.File.getBuild()
+  -> StorageDiff.Init()
+  -> persistence.OpenSeekable(path)
+  -> block.NewChunker(size, blockSize, seekable, localCachePath)
+  -> first ReadAt/Slice(page range)
+  -> Chunker.runFetch()
+  -> seekable.OpenRangeReader(offset, length)
+  -> io.ReadFull(reader, mmapSlice[...])
+  -> mark chunk cached</code></pre>
+
+  <h3>传统路径的数据拷贝</h3>
+  <table>
+    <thead>
+    <tr><th>环节</th><th>典型行为</th><th>开销来源</th></tr>
+    </thead>
+    <tbody>
+    <tr><td data-label="环节">网络协议栈</td><td data-label="典型行为">HTTP/TLS/GCS/S3 response body 流式读取。</td><td data-label="开销来源">内核 buffer、TLS 解密、HTTP framing、用户态 reader。</td></tr>
+    <tr><td data-label="环节">Go reader 到 mmap</td><td data-label="典型行为"><code>io.ReadFull</code> 把数据写入 <code>mmapSlice</code>。</td><td data-label="开销来源">用户态复制、批大小控制、goroutine 调度。</td></tr>
+    <tr><td data-label="环节">压缩对象</td><td data-label="典型行为">按 frame 定位压缩范围，读取后解压为 uncompressed chunk。</td><td data-label="开销来源">CPU 解压和 frame 边界查找；压缩可减少网络流量但增加 CPU。</td></tr>
+    <tr><td data-label="环节">本机 cache 命中</td><td data-label="典型行为">后续读取直接返回 mmap slice。</td><td data-label="开销来源">主要剩下内存访问和 bitmap/cache 状态检查。</td></tr>
+    </tbody>
+  </table>
+
+  <h2>四、基于 Mooncake 的数据加载方式</h2>
+  <p>Mooncake backend 有两种形态：HTTP 兼容模式和 native zero-copy 模式。HTTP 模式仍是传统 stream/copy 路径；native 模式通过 Mooncake Store Go binding 接入 <code>RegisterBuffer</code> 和 <code>GetInto</code>，使远端数据直接落到 chunker mmap cache。</p>
+
+  <div class="grid">
+    <div class="card">
+      <h3>Mooncake HTTP 模式</h3>
+      <p><span class="tag">兼容优先</span><span class="tag">无 cgo</span></p>
+      <p>配置 <code>STORAGE_PROVIDER=Mooncake</code> 与 <code>MOONCAKE_HTTP_ENDPOINT</code> 后，<code>storage_mooncake.go</code> 使用 HTTP object API。它可以复用现有 seekable/block manifest 逻辑，但仍存在 HTTP body 到 mmap cache 的用户态拷贝。</p>
+    </div>
+    <div class="card">
+      <h3>Mooncake native + URMA</h3>
+      <p><span class="tag">mooncake_cgo</span><span class="tag">RegisterBuffer</span><span class="tag">GetInto</span></p>
+      <p>启用 <code>MOONCAKE_NATIVE_ENABLED=true</code> 后，native client 在有 Mooncake 库的节点连接 metadata/master。chunker 创建 mmap 后注册整段 host cache，读取时调用 <code>ReadRangeInto</code>，最终使用 Mooncake <code>GetInto</code> 写入已注册地址。</p>
+    </div>
+  </div>
+
+  <h3>Mooncake native zero-copy read 路径</h3>
+  <pre><code>StorageDiff.Init()
+  -> persistence.OpenSeekable(path) returns mooncakeSeekable(native client)
+  -> block.NewChunker(...)
+  -> cache.RegisterWith(upstream)
+       -> nativeMooncakeClient.RegisterBuffer(mmapPtr, mmapSize)
+  -> first ReadAt/Slice(page range)
+  -> Chunker.runFetch()
+  -> upstream.ReadRangeInto(mmapSlice, chunkOffset)
+       -> mooncakeSeekable.ReadRangeInto(...)
+       -> nativeMooncakeClient.ReadIntoRegistered(...)
+       -> Mooncake Store GetInto(key, mmapPtr+offset, len)
+  -> mark chunk cached
+  -> Chunker.Close()
+       -> UnregisterBuffer(mmapPtr)
+       -> mmap.Unmap()</code></pre>
+
+  <div class="note">这里的“零拷贝”指 Mooncake/URMA 到 e2b host mmap cache 的数据面不再经过 Go reader 中间 buffer。VM 侧读取、NBD/UFFD、CPU page table、存储设备或网络栈内部仍可能存在硬件/内核层面的 DMA、cache coherency 和页表管理开销。</div>
+
+  <h2>五、性能分析对比</h2>
+  <table>
+    <thead>
+    <tr><th>维度</th><th>传统对象存储</th><th>Mooncake HTTP</th><th>Mooncake native + URMA zero-copy</th></tr>
+    </thead>
+    <tbody>
+    <tr><td data-label="维度">远端访问协议</td><td data-label="传统对象存储">GCS/S3 HTTP range 或类似对象存储 API。</td><td data-label="Mooncake HTTP">Mooncake HTTP object API。</td><td data-label="Mooncake native + URMA zero-copy">Mooncake Store client + RDMA/URMA transfer engine。</td></tr>
+    <tr><td data-label="维度">落入 host cache</td><td data-label="传统对象存储">reader -> Go buffer/read loop -> mmap slice。</td><td data-label="Mooncake HTTP">HTTP response -> read loop -> mmap slice。</td><td data-label="Mooncake native + URMA zero-copy">Mooncake <code>GetInto</code> 直接写入已注册 mmap slice。</td></tr>
+    <tr><td data-label="维度">CPU 消耗</td><td data-label="传统对象存储"><span class="warn">较高</span>，HTTP/TLS、copy、可能解压。</td><td data-label="Mooncake HTTP"><span class="neutral">中等</span>，后端更近时网络开销下降，但 HTTP/copy 仍在。</td><td data-label="Mooncake native + URMA zero-copy"><span class="good">最低</span>，减少用户态 copy 和协议处理，CPU 更接近调度/metadata/bitmap 开销。</td></tr>
+    <tr><td data-label="维度">首 chunk 延迟</td><td data-label="传统对象存储">受对象存储 RTT、range request、TLS 和跨 AZ/公网路径影响。</td><td data-label="Mooncake HTTP">取决于 Mooncake 集群距离和 HTTP 服务实现，通常低于云对象存储。</td><td data-label="Mooncake native + URMA zero-copy">主要取决于 Mooncake metadata 查找、RDMA path 和远端 segment 状态，预期最低。</td></tr>
+    <tr><td data-label="维度">吞吐上限</td><td data-label="传统对象存储">常受 HTTP 并发、对象存储限速、CPU copy 限制。</td><td data-label="Mooncake HTTP">后端更可控，但 HTTP handler 和 copy 仍可能成为瓶颈。</td><td data-label="Mooncake native + URMA zero-copy">更接近网卡/RDMA fabric、Mooncake segment 和内存带宽上限。</td></tr>
+    <tr><td data-label="维度">本机重复读取</td><td data-label="传统对象存储">命中 mmap cache 后很快。</td><td data-label="Mooncake HTTP">同传统路径。</td><td data-label="Mooncake native + URMA zero-copy">同传统路径；优势主要在首次远端 fetch。</td></tr>
+    <tr><td data-label="维度">运维复杂度</td><td data-label="传统对象存储">最低，依赖云存储或文件系统。</td><td data-label="Mooncake HTTP">中等，需要 Mooncake HTTP 服务。</td><td data-label="Mooncake native + URMA zero-copy">最高，需要 Mooncake C/C++ 库、Go binding、URMA/RDMA 设备、memlock、库路径和 build tag。</td></tr>
+    <tr><td data-label="维度">失败回退</td><td data-label="传统对象存储">成熟稳定。</td><td data-label="Mooncake HTTP">可作为 native 不启用时的兼容路径。</td><td data-label="Mooncake native + URMA zero-copy">注册失败会使 chunker 初始化失败，应通过部署策略控制只在合格节点启用。</td></tr>
+    </tbody>
+  </table>
+
+  <h3>定性性能结论</h3>
+  <table>
+    <thead>
+    <tr><th>场景</th><th>主要瓶颈</th><th>最佳路径</th><th>原因</th></tr>
+    </thead>
+    <tbody>
+    <tr><td data-label="场景">冷启动首次加载大 memfile/rootfs</td><td data-label="主要瓶颈">远端读取、用户态 copy、对象存储 RTT。</td><td data-label="最佳路径"><span class="good">Mooncake native + URMA</span></td><td data-label="原因">减少协议栈和 copy，数据直接进入 host mmap cache。</td></tr>
+    <tr><td data-label="场景">同一节点重复启动相同 template</td><td data-label="主要瓶颈">本机 cache 命中后的内存访问。</td><td data-label="最佳路径"><span class="neutral">差异较小</span></td><td data-label="原因">chunk 已在 mmap cache 中，远端 backend 不再参与。</td></tr>
+    <tr><td data-label="场景">跨节点复用热 template</td><td data-label="主要瓶颈">跨节点远端拉取和热点带宽。</td><td data-label="最佳路径"><span class="good">Mooncake native 或 peer routing</span></td><td data-label="原因">Mooncake 可作为分布式低延迟数据面；peer routing 可减少对象存储回源。</td></tr>
+    <tr><td data-label="场景">压缩 diff</td><td data-label="主要瓶颈">解压 CPU 和 frame 读取。</td><td data-label="最佳路径"><span class="neutral">视数据而定</span></td><td data-label="原因">压缩降低网络流量，但 zero-copy 对解压后的 CPU 开销帮助有限；当前 Mooncake seekable 对 compressed path 有限制。</td></tr>
+    <tr><td data-label="场景">小对象 metadata/snapfile</td><td data-label="主要瓶颈">请求 RTT 和调度。</td><td data-label="最佳路径"><span class="neutral">Mooncake HTTP/native 差距有限</span></td><td data-label="原因">对象较小，copy 不是主要开销。</td></tr>
+    </tbody>
+  </table>
+
+  <h2>六、性能观测建议</h2>
+  <p>对比时应分开观测冷启动、热启动、首 chunk、全量恢复和 page fault tail latency。推荐至少记录以下指标：</p>
+  <table>
+    <thead>
+    <tr><th>指标</th><th>含义</th><th>相关代码/埋点</th></tr>
+    </thead>
+    <tbody>
+    <tr><td data-label="指标"><code>orchestrator.templates.cache.hits/misses</code></td><td data-label="含义">template TTL cache 是否命中。</td><td data-label="相关代码/埋点"><code>template/cache.go</code></td></tr>
+    <tr><td data-label="指标"><code>orchestrator.blocks.chunks.fetch</code></td><td data-label="含义">远端 chunk fetch 耗时和字节数。</td><td data-label="相关代码/埋点"><code>block/streaming_chunk.go</code></td></tr>
+    <tr><td data-label="指标"><code>orchestrator.blocks.chunks.store</code></td><td data-label="含义">写入 mmap cache 的耗时。</td><td data-label="相关代码/埋点"><code>progressiveRead</code></td></tr>
+    <tr><td data-label="指标"><code>orchestrator.blocks.slices</code></td><td data-label="含义">读取 slice 的整体耗时，区分 cache hit 和 remote fetch。</td><td data-label="相关代码/埋点"><code>Chunker.Slice</code></td></tr>
+    <tr><td data-label="指标">Mooncake transfer metrics</td><td data-label="含义">RDMA/URMA 传输吞吐、失败率、segment 状态。</td><td data-label="相关代码/埋点">Mooncake runtime / monitoring。</td></tr>
+    </tbody>
+  </table>
+
+  <h2>七、配置摘要</h2>
+  <h3>传统对象存储</h3>
+  <pre><code>export STORAGE_PROVIDER=GCPBucket   # 或 AWSBucket / Local
+export TEMPLATE_BUCKET_NAME=...
+export BUILD_CACHE_BUCKET_NAME=...</code></pre>
+
+  <h3>Mooncake HTTP</h3>
+  <pre><code>export STORAGE_PROVIDER=Mooncake
+export MOONCAKE_HTTP_ENDPOINT=http://mooncake-http.example:8080
+export MOONCAKE_NAMESPACE=templates</code></pre>
+
+  <h3>Mooncake native + URMA</h3>
+  <pre><code>export STORAGE_PROVIDER=Mooncake
+export MOONCAKE_NATIVE_ENABLED=true
+export MOONCAKE_NAMESPACE=templates
+export MC_METADATA_SERVER=http://mooncake-master:8080/metadata
+export MC_MASTER_ADDR=mooncake-master:50051
+export MC_LOCAL_HOSTNAME=&lt;host ip visible to Mooncake&gt;
+export MC_PROTOCOL=rdma
+
+# build:
+go test -tags mooncake_cgo ./packages/shared/pkg/storage
+go test -tags mooncake_cgo ./packages/orchestrator/pkg/sandbox/block</code></pre>
+
+  <div class="note">更详细的 Mooncake native 编译环境、CGO flags 和排查项见 <code>mooncake-usage.html</code>。</div>
+</main>
+</body>
+</html>
